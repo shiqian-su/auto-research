@@ -75,8 +75,9 @@ def _add_runner_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--dangerously-bypass-approvals-and-sandbox",
-        action="store_true",
-        help="Use Codex with no sandbox and no approval gate on fresh runs.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to run Codex with no sandbox and no approval gate. Defaults to enabled; use --no-dangerously-bypass-approvals-and-sandbox to opt out.",
     )
     parser.add_argument(
         "--skip-git-repo-check",

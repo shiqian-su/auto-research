@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from .codex import (
 )
 from .reports import build_report_paths
 from .state import RunState, StateStore
+from .tasklog import TaskLogger, build_log_file_path, shell_join
 
 
 @dataclass(frozen=True)
@@ -29,7 +31,7 @@ class RunnerConfig:
     reasoning_effort: str = "high"
     sandbox: str = "workspace-write"
     full_auto: bool = True
-    bypass_sandbox: bool = False
+    bypass_sandbox: bool = True
     skip_git_repo_check: bool = False
     max_restarts: int = 3
     restart_backoff_seconds: float = 3.0
@@ -79,6 +81,7 @@ class AutoResearchRunner:
     ) -> None:
         self.config = config
         self.workspace = config.workspace.resolve()
+        self.project_root = Path(__file__).resolve().parents[2]
         self.reports = build_report_paths(self.workspace)
         self.state_store = StateStore(self.reports.runtime_dir / "state.json")
         self.session_locator = CodexSessionLocator(codex_home=codex_home)
@@ -86,14 +89,37 @@ class AutoResearchRunner:
         self.lock = WorkspaceLock(self.reports.runtime_dir / "runner.lock")
         self.stop_requested = False
         self.current_process: subprocess.Popen[str] | None = None
+        self.current_output_thread: threading.Thread | None = None
+        self.task_logger: TaskLogger | None = None
 
     def run(self, *, force_resume: bool = False) -> int:
         self.state.update_report_paths(self.reports)
+        self._ensure_task_log_file()
         self.state_store.save(self.state)
+        self._log_event(
+            "runner_started",
+            workspace=str(self.workspace),
+            force_resume=force_resume,
+            fresh=self.config.fresh,
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+            log_file=self.state.log_file,
+        )
+        print(f"[auto-research] log file: {self.state.log_file}", file=sys.stderr)
 
-        with self.lock, self._signal_guard():
-            session_id = self._pick_resume_session(force_resume=force_resume)
-            return self._run_loop(session_id=session_id)
+        try:
+            with self.lock, self._signal_guard():
+                session_id = self._pick_resume_session(force_resume=force_resume)
+                if session_id:
+                    self._log_event(
+                        "resume_planned",
+                        session_id=session_id,
+                        framework_resume_command=f"auto-research resume --workspace {self.workspace}",
+                    )
+                return self._run_loop(session_id=session_id)
+        finally:
+            self._log_event("runner_finished", status=self.state.status)
+            self._close_task_logger()
 
     def print_status(self, *, stream=None) -> None:
         stream = stream or sys.stdout
@@ -107,7 +133,14 @@ class AutoResearchRunner:
         print(f"restart_count: {state.restart_count}", file=stream)
         print(f"last_exit_code: {state.last_exit_code if state.last_exit_code is not None else '-'}", file=stream)
         print(f"updated_at: {state.updated_at or '-'}", file=stream)
+        print(f"log_file: {state.log_file or '-'}", file=stream)
         print(f"resumable: {resumable}", file=stream)
+        if state.session_id:
+            print(
+                f"framework_resume: auto-research resume --workspace {state.workspace}",
+                file=stream,
+            )
+            print(f"session_id: {state.session_id}", file=stream)
 
     def _run_loop(self, *, session_id: str | None) -> int:
         attempt = self.state.restart_count if session_id else 0
@@ -155,10 +188,16 @@ class AutoResearchRunner:
             if discovered and self.state.session_id != discovered:
                 self.state.session_id = discovered
                 self.state_store.save(self.state)
+                self._log_event(
+                    "session_discovered",
+                    session_id=discovered,
+                    framework_resume_command=f"auto-research resume --workspace {self.workspace}",
+                )
 
             if exit_code == 0:
                 self.state.mark_completed(exit_code=exit_code)
                 self.state_store.save(self.state)
+                self._log_event("codex_completed", exit_code=exit_code)
                 return exit_code
 
             if self.stop_requested:
@@ -167,6 +206,11 @@ class AutoResearchRunner:
                     error="runner interrupted by signal",
                 )
                 self.state_store.save(self.state)
+                self._log_event(
+                    "runner_interrupted",
+                    exit_code=exit_code,
+                    session_id=self.state.session_id,
+                )
                 return exit_code if exit_code != 0 else 130
 
             if not self.state.session_id:
@@ -175,6 +219,10 @@ class AutoResearchRunner:
                     error="codex exited without a recoverable session id",
                 )
                 self.state_store.save(self.state)
+                self._log_event(
+                    "codex_failed_without_session",
+                    exit_code=exit_code,
+                )
                 return exit_code if exit_code != 0 else 1
 
             if attempt >= self.config.max_restarts:
@@ -183,6 +231,11 @@ class AutoResearchRunner:
                     error="maximum automatic resume attempts reached",
                 )
                 self.state_store.save(self.state)
+                self._log_event(
+                    "auto_resume_limit_reached",
+                    exit_code=exit_code,
+                    session_id=self.state.session_id,
+                )
                 return exit_code if exit_code != 0 else 1
 
             attempt += 1
@@ -192,6 +245,13 @@ class AutoResearchRunner:
                 error="codex exited unexpectedly; attempting automatic resume",
             )
             self.state_store.save(self.state)
+            self._log_event(
+                "auto_resume_scheduled",
+                exit_code=exit_code,
+                attempt=attempt,
+                session_id=self.state.session_id,
+                framework_resume_command=f"auto-research resume --workspace {self.workspace}",
+            )
             time.sleep(self.config.restart_backoff_seconds)
             active_session_id = self.state.session_id
 
@@ -207,7 +267,10 @@ class AutoResearchRunner:
                 invocation.command,
                 cwd=str(self.workspace),
                 stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,
             )
         except OSError as exc:
             raise RuntimeError(
@@ -222,6 +285,20 @@ class AutoResearchRunner:
             session_id=session_id,
         )
         self.state_store.save(self.state)
+        self._log_event(
+            "codex_started",
+            run_id=run_id,
+            prompt_kind=invocation.prompt_kind,
+            child_pid=process.pid,
+            session_id=session_id or None,
+            command=shell_join(invocation.command),
+        )
+        self.current_output_thread = threading.Thread(
+            target=self._stream_process_output,
+            args=(process,),
+            daemon=True,
+        )
+        self.current_output_thread.start()
         assert process.stdin is not None
         process.stdin.write(invocation.prompt)
         process.stdin.close()
@@ -236,6 +313,9 @@ class AutoResearchRunner:
         while True:
             exit_code = process.poll()
             if exit_code is not None:
+                if self.current_output_thread is not None:
+                    self.current_output_thread.join(timeout=5.0)
+                    self.current_output_thread = None
                 self.current_process = None
                 return exit_code
             discovered = self._discover_session(
@@ -245,6 +325,11 @@ class AutoResearchRunner:
             if discovered and self.state.session_id != discovered:
                 self.state.session_id = discovered
                 self.state_store.save(self.state)
+                self._log_event(
+                    "session_discovered",
+                    session_id=discovered,
+                    framework_resume_command=f"auto-research resume --workspace {self.workspace}",
+                )
             time.sleep(2.0)
 
     def _discover_session(
@@ -277,6 +362,50 @@ class AutoResearchRunner:
                 self.state_store.save(self.state)
                 return candidate.session_id
         return None
+
+    def _ensure_task_log_file(self) -> None:
+        if self.config.fresh:
+            self.state.log_file = ""
+        log_path: Path
+        if self.state.log_file:
+            existing = Path(self.state.log_file)
+            if existing.exists():
+                log_path = existing
+            else:
+                log_path = build_log_file_path(
+                    self.workspace,
+                    project_root=self.project_root,
+                )
+        else:
+            log_path = build_log_file_path(
+                self.workspace,
+                project_root=self.project_root,
+            )
+        self.state.log_file = str(log_path)
+        self.task_logger = TaskLogger(log_path)
+
+    def _close_task_logger(self) -> None:
+        if self.task_logger is None:
+            return
+        self.task_logger.close()
+        self.task_logger = None
+
+    def _log_event(self, event: str, **fields) -> None:
+        if self.task_logger is None:
+            return
+        self.task_logger.event(event, **fields)
+
+    def _stream_process_output(self, process: subprocess.Popen[str]) -> None:
+        if process.stdout is None:
+            return
+        try:
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if self.task_logger is not None:
+                    self.task_logger.output_line(line)
+        finally:
+            process.stdout.close()
 
     @contextmanager
     def _signal_guard(self):

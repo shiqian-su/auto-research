@@ -11,6 +11,7 @@ from auto_research.cli import main
 from auto_research.codex import build_exec_invocation
 from auto_research.reports import ensure_report_files, validate_report_readiness
 from auto_research.state import RunState, StateStore
+from auto_research.tasklog import build_log_file_path
 
 
 class ReportBootstrapTests(unittest.TestCase):
@@ -34,7 +35,7 @@ class ReportBootstrapTests(unittest.TestCase):
                 reasoning_effort="high",
                 sandbox="workspace-write",
                 full_auto=True,
-                bypass_sandbox=False,
+                bypass_sandbox=True,
                 skip_git_repo_check=True,
                 output_file=reports.runtime_dir / "last_message.txt",
                 extra_instructions="keep iterating",
@@ -46,7 +47,7 @@ class ReportBootstrapTests(unittest.TestCase):
             self.assertIn("-m", command)
             self.assertIn("gpt-5.4", command)
             self.assertIn('model_reasoning_effort="high"', command)
-            self.assertIn("--full-auto", command)
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
             self.assertIn("--skip-git-repo-check", command)
 
     def test_state_roundtrip_preserves_session(self):
@@ -89,6 +90,18 @@ class ReportBootstrapTests(unittest.TestCase):
             message = stderr.getvalue()
             self.assertIn("not ready for run/resume", message)
             self.assertIn("auto-research init", message)
+
+    def test_log_file_path_is_created_under_logs_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            workspace = project_root / "demo-workspace"
+            workspace.mkdir()
+
+            log_path = build_log_file_path(workspace, project_root=project_root)
+
+            self.assertEqual(log_path.parent, project_root / "logs")
+            self.assertEqual(log_path.suffix, ".log")
+            self.assertIn("demo-workspace", log_path.name)
 
 
 if __name__ == "__main__":

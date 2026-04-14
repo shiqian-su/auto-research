@@ -29,12 +29,20 @@ The framework stores its own runtime state under:
 - `workspace/auto-research-reports/.auto-research/runner.lock`
 - `workspace/auto-research-reports/.auto-research/last_message.txt`
 
+The framework also writes per-task logs under:
+
+- `auto-research/logs/*.log`
+
+The `logs/` directory is gitignored.
+
 ## Install
 
 ```bash
 cd auto-research
 pip install -e .
 ```
+
+If your environment falls back to legacy editable installs, the repository also includes a compatible `setup.py` so `pip install -e .` still works.
 
 ## Commands
 
@@ -55,7 +63,35 @@ auto-research run \
   --reasoning-effort high
 ```
 
+By default the runner starts Codex with `--dangerously-bypass-approvals-and-sandbox`.
+
+Warning:
+This disables Codex sandboxing and approval prompts. Use it only in an environment you already trust and isolate yourself. To opt out for a run, pass `--no-dangerously-bypass-approvals-and-sandbox`.
+
 Before `run` or `resume`, the CLI checks that `SKILL.md`, `TASK.md`, `IDEAS.md`, and `ITERATION.md` all exist. `TASK.md` must be filled with real content before the run starts. `IDEAS.md` may stay on the default scaffold initially, and `SKILL.md` / `ITERATION.md` may also start from the generated template.
+
+## Logs And Recovery
+
+Each task run gets a log file under `auto-research/logs/`. The log records key events such as:
+
+- runner start and finish
+- Codex launch command
+- discovered `session_id`
+- automatic resume attempts
+- final exit status
+
+If the `codex` CLI exits unexpectedly, the runner first tries automatic in-process recovery by locating the persisted Codex session and calling `codex exec resume` again.
+
+If the whole runner process is interrupted, you can recover later in two ways:
+
+- Preferred: run `auto-research resume --workspace /path/to/workspace`
+- Manual fallback: inspect `state.json` or the corresponding `logs/*.log` file for the `session_id`
+
+The `status` command prints the latest known `session_id` and log path for the workspace.
+
+## Terminal Output
+
+Codex output is streamed to the terminal in real time while also being written to the task log file.
 
 Resume the latest unfinished session for the workspace:
 
@@ -76,8 +112,9 @@ Fresh runs use `codex exec` and include:
 - `-C <workspace>`
 - `-m <model>`
 - `-c model_reasoning_effort="<effort>"`
+- `--dangerously-bypass-approvals-and-sandbox` by default
 
-By default the runner also adds `--full-auto` and `-s workspace-write`.
+If you opt out of dangerous mode, the runner falls back to sandboxed execution and adds `-s workspace-write --full-auto`.
 
 Resume runs use `codex exec resume <session_id>` and carry the same model and reasoning-effort settings.
 

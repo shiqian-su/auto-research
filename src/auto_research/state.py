@@ -31,6 +31,7 @@ class RunState:
     last_error: str = ""
     last_command: list[str] = field(default_factory=list)
     last_prompt_kind: str = ""
+    log_file: str = ""
     reports_dir: str = ""
     skill_file: str = ""
     task_file: str = ""
